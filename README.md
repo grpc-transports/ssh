@@ -4,7 +4,7 @@ Transparent SSH tunnel transport layer for gRPC. The server wraps inbound SSH co
 
 Supports Ed25519 host-key auto-generation and SSH agent forwarding for client authentication.
 
-For inter-VM gRPC where SSH's per-user auth model is a poor fit, see the sibling [`wireguard`](../wireguard).
+For inter-VM gRPC where SSH's per-user auth model is a poor fit, see the sibling [`wireguard`](https://github.com/grpc-transports/wireguard).
 
 ## Module
 
@@ -39,18 +39,18 @@ func DialOption(addr, keyPath, knownHostsPath string) (grpc.DialOption, error)
 
 ## Usage
 
-**Server side (`vzd`):**
+**Server side (e.g. `weft agent`):**
 
 ```go
 lis, err := sshtransport.ListenSSH("unix:"+socketPath, sshtransport.ServerConfig{
-    HostKeyPath:        "~/.vzd/vzd_host_key",
-    AuthorizedKeysPath: "~/.vzd/authorized_keys",
+    HostKeyPath:        "~/.weft/agent_host_key",
+    AuthorizedKeysPath: "~/.weft/authorized_keys",
     Logger:             logger,
 })
 grpcServer.Serve(lis)
 ```
 
-**Client side (`vzc`):**
+**Client side (e.g. `weft` CLI):**
 
 ```go
 opt, err := sshtransport.DialOption("unix:"+sshSocket, keyPath, "")
@@ -59,7 +59,7 @@ conn, err := grpc.Dial("passthrough:///target", opt)
 
 ## Used by
 
-- [`openweft/weft`](../../openweft/weft) — SSH-secured gRPC listener
-- [`openweft/vzc`](../../openweft/vzc) — SSH-tunnelled gRPC client
-- [`openweft/weft-ui`](../../openweft/weft-ui) — SSH-tunnelled gRPC client
-- [`openweft/terraform-provider-weft`](../../openweft/terraform-provider-weft) — provider gRPC transport
+- [`openweft/weft`](https://github.com/openweft/weft) — SSH-secured gRPC listener
+- [`openweft/weft-client`](https://github.com/openweft/weft-client) — SSH-tunnelled gRPC client
+- [`openweft/weft-webui`](https://github.com/openweft/weft-webui) — SSH-tunnelled gRPC client
+- [`openweft/terraform-provider-weft`](https://github.com/openweft/terraform-provider-weft) — provider gRPC transport
