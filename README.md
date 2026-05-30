@@ -57,6 +57,68 @@ opt, err := sshtransport.DialOption("unix:"+sshSocket, keyPath, "")
 conn, err := grpc.Dial("passthrough:///target", opt)
 ```
 
+## Pluggable verifiers (OpenPubkey, FIDO2, sigstore)
+
+`ServerConfig.AuthCallback` is a hook called BEFORE the `authorized_keys`
+file check. It receives the client's public key and returns either a
+`*ssh.Permissions` (authorised) or an error (fall through to the file).
+This is the seam for verifiers that don't rely on long-lived static
+public keys.
+
+### OpenPubkey sketch
+
+[OpenPubkey](https://github.com/openpubkey/openpubkey) replaces the
+"pre-distribute SSH public keys" model with "verify an OIDC ID-token
+signed by a trusted IdP at connect time". Useful for ephemeral microVM
+workloads where there's no human to distribute keys to.
+
+```go
+import (
+    "context"
+
+    sshtransport "github.com/grpc-transports/ssh"
+    "github.com/openpubkey/openpubkey/verifier"
+    "github.com/openpubkey/openpubkey/providers"
+    "golang.org/x/crypto/ssh"
+)
+
+func openpubkeyCallback(v *verifier.Verifier) func(ssh.ConnMetadata, ssh.PublicKey) (*ssh.Permissions, error) {
+    return func(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
+        // Convention: the client sends the PK Token base64-encoded as the
+        // SSH key comment field. Other transports (cert extension, custom
+        // SSH request) work too — pick whichever your client supports.
+        pkt, err := extractPKTokenFromKey(key)
+        if err != nil {
+            return nil, err
+        }
+        if err := v.VerifyPKToken(context.Background(), pkt); err != nil {
+            return nil, err
+        }
+        return &ssh.Permissions{
+            Extensions: map[string]string{
+                "auth":   "openpubkey",
+                "issuer": pkt.Op.Issuer(),
+                "sub":    pkt.Op.Subject(),
+            },
+        }, nil
+    }
+}
+
+// Server wiring:
+v := verifier.New([]providers.OpenIdProvider{
+    providers.NewGoogleOp(),     // or your enterprise IdP
+})
+lis, _ := sshtransport.ListenSSH("unix:/tmp/agent.sock", sshtransport.ServerConfig{
+    HostKeyPath:  "/etc/weft/host_key",
+    AuthCallback: openpubkeyCallback(v),
+    // AuthorizedKeysPath stays optional — when set, breakglass keys still work.
+})
+```
+
+A returning-error callback falls back to `AuthorizedKeysPath`, so an
+operator misconfiguring the OpenPubkey verifier can't lock themselves
+out if they kept a breakglass key in the file.
+
 ## Used by
 
 - [`openweft/weft`](https://github.com/openweft/weft) — SSH-secured gRPC listener

@@ -348,3 +348,98 @@ func TestIntegration_Roundtrip(t *testing.T) {
 		t.Errorf("client got %q, want %q", gotReply, reply)
 	}
 }
+
+// TestAuthCallback_BypassesAuthorizedKeys verifies the AuthCallback hook
+// authorises a key that is NOT in authorized_keys. The callback wins when
+// it returns a nil error and non-nil *ssh.Permissions; the file-based
+// check never runs. This is the seam used by OpenPubkey / FIDO2 / sigstore
+// integrations.
+func TestAuthCallback_BypassesAuthorizedKeys(t *testing.T) {
+	dir := t.TempDir()
+	hostKeyPath := filepath.Join(dir, "host_key")
+	// authorized_keys file is intentionally absent — the callback is the
+	// only valid auth path.
+
+	clientSigner, clientPub := generateEd25519Signer(t)
+	var seenFP string
+	cb := func(_ ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
+		seenFP = ssh.FingerprintSHA256(key)
+		return &ssh.Permissions{
+			Extensions: map[string]string{"auth": "callback"},
+		}, nil
+	}
+
+	lis, err := ListenSSH("tcp:127.0.0.1:0", ServerConfig{
+		HostKeyPath:  hostKeyPath,
+		AuthCallback: cb,
+	})
+	if err != nil {
+		t.Fatalf("ListenSSH: %v", err)
+	}
+	defer lis.Close()
+	go func() { _, _ = lis.Accept() }()
+
+	rawConn, err := net.Dial("tcp", lis.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	sconn, _, _, err := ssh.NewClientConn(rawConn, lis.Addr().String(), &ssh.ClientConfig{
+		User:            "anyone",
+		Auth:            []ssh.AuthMethod{ssh.PublicKeys(clientSigner)},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(), //nolint:gosec
+	})
+	if err != nil {
+		t.Fatalf("ssh handshake: %v", err)
+	}
+	defer sconn.Close()
+
+	wantFP := ssh.FingerprintSHA256(clientPub)
+	if seenFP != wantFP {
+		t.Errorf("callback saw fp %q, want %q", seenFP, wantFP)
+	}
+}
+
+// TestAuthCallback_FallsBackToAuthorizedKeys verifies that an AuthCallback
+// returning an error doesn't lock out a key listed in authorized_keys —
+// the file-based check still runs. Prevents misconfigured callbacks from
+// turning into a self-lockout.
+func TestAuthCallback_FallsBackToAuthorizedKeys(t *testing.T) {
+	dir := t.TempDir()
+	hostKeyPath := filepath.Join(dir, "host_key")
+	authKeysPath := filepath.Join(dir, "authorized_keys")
+
+	clientSigner, clientPub := generateEd25519Signer(t)
+	if err := os.WriteFile(authKeysPath, ssh.MarshalAuthorizedKey(clientPub), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Callback always refuses — the file MUST be consulted next.
+	cb := func(_ ssh.ConnMetadata, _ ssh.PublicKey) (*ssh.Permissions, error) {
+		return nil, io.EOF
+	}
+
+	lis, err := ListenSSH("tcp:127.0.0.1:0", ServerConfig{
+		HostKeyPath:        hostKeyPath,
+		AuthorizedKeysPath: authKeysPath,
+		AuthCallback:       cb,
+	})
+	if err != nil {
+		t.Fatalf("ListenSSH: %v", err)
+	}
+	defer lis.Close()
+	go func() { _, _ = lis.Accept() }()
+
+	rawConn, err := net.Dial("tcp", lis.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	sconn, _, _, err := ssh.NewClientConn(rawConn, lis.Addr().String(), &ssh.ClientConfig{
+		User:            "anyone",
+		Auth:            []ssh.AuthMethod{ssh.PublicKeys(clientSigner)},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(), //nolint:gosec
+	})
+	if err != nil {
+		t.Fatalf("ssh handshake (callback should fall back to authorized_keys): %v", err)
+	}
+	sconn.Close()
+}
