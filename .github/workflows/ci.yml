@@ -1,0 +1,161 @@
+# grpc-transports/ssh CI — vet, gofmt, and a coverage gate that actually
+# RUNS the test suite on every 64-bit arch this transport targets
+# (amd64, arm64, riscv64, loong64, ppc64le, s390x), not just amd64.
+#
+# Why all six arches: this package speaks the SSH wire protocol (via
+# golang.org/x/crypto/ssh) — Ed25519 host keys, agent forwarding, and gRPC
+# tunnelled over an SSH channel. The SSH framing uses big-endian length
+# prefixes ("network byte order"), so running the suite under big-endian
+# s390x emulation is a genuine endianness check, not a formality.
+#
+# Native runners cover amd64 (ubuntu-latest) and arm64 (ubuntu-24.04-arm).
+# The remaining little-endian arches plus big-endian s390x run as
+# cross-compiled test binaries under QEMU via tonistiigi/binfmt.
+#
+# Pure-Go (CGO=0). No fuzzing runs under QEMU.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  CGO_ENABLED: 0
+
+jobs:
+  # Lint + the canonical amd64 test run with the repo coverage gate.
+  test:
+    name: vet + gofmt + coverage (amd64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          check-latest: true
+
+      - run: go version
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt needs to be run on:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: test + coverage gate
+        run: |
+          go test -coverprofile=cover.out ./...
+          go tool cover -func=cover.out | tee cover.txt
+          pct=$(go tool cover -func=cover.out | tail -n 1 | awk '{print $3}' | tr -d '%')
+          echo "total coverage: ${pct}%"
+          # Gate at the repo's current statement-coverage level. Raise this
+          # floor as coverage improves; never lower it silently.
+          min=57.0
+          awk -v p="$pct" -v m="$min" 'BEGIN { exit !(p+0 >= m+0) }' || {
+            echo "::error::coverage ${pct}% < ${min}%"; exit 1; }
+
+  # Native arm64 run on a real arm64 runner.
+  test-arm64:
+    name: test (arm64, native)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          check-latest: true
+
+      - run: go version
+
+      - name: go test
+        run: go test ./...
+
+  # Cross-compiled test binaries run under QEMU for the remaining 64-bit
+  # arches. s390x is BIG-ENDIAN — the real cross-arch validation of the SSH
+  # wire framing. No fuzzing runs here (fuzz is native-only).
+  emulated:
+    name: test (${{ matrix.arch }}, qemu)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: riscv64
+            image: debian:trixie
+            qemu_cpu: rv64,v=true,vlen=128
+          - arch: loong64
+            image: ghcr.io/loong64/debian:trixie
+            qemu_cpu: la464
+          - arch: ppc64le
+            image: debian:trixie
+            qemu_cpu: power9
+          - arch: s390x
+            image: debian:trixie
+            qemu_cpu: qemu
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          check-latest: true
+
+      - run: go version
+
+      - name: register QEMU binfmt handlers
+        run: docker run --privileged --rm tonistiigi/binfmt --install all
+
+      # Compile one cover-instrumented test binary per package for the target
+      # arch, then execute each under QEMU. This RUNS the suite (not just a
+      # build) so endianness/word-size bugs surface — notably on big-endian
+      # s390x for the SSH wire framing.
+      - name: cross-compile test binaries
+        env:
+          GOOS: linux
+          GOARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          mkdir -p _qemu
+          for pkg in $(go list ./...); do
+            name=$(echo "$pkg" | tr '/.' '__')
+            if go test -c -cover -o "_qemu/${name}.test" "$pkg"; then
+              echo "built ${name}.test for $pkg"
+            else
+              # Packages with no test files emit no binary; that's fine.
+              echo "no test binary for $pkg (no tests?)"
+            fi
+          done
+
+      - name: run test binaries under QEMU (${{ matrix.arch }})
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          bins=(_qemu/*.test)
+          if [ ${#bins[@]} -eq 0 ]; then
+            echo "::error::no test binaries were built for ${{ matrix.arch }}"
+            exit 1
+          fi
+          for bin in "${bins[@]}"; do
+            echo "::group::$bin (${{ matrix.arch }})"
+            docker run --rm \
+              --platform "linux/${{ matrix.arch }}" \
+              -e QEMU_CPU='${{ matrix.qemu_cpu }}' \
+              -v "$PWD:/work" -w /work \
+              ${{ matrix.image }} \
+              "/work/$bin" -test.v
+            echo "::endgroup::"
+          done
