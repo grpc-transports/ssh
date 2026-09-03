@@ -3,7 +3,7 @@ module github.com/grpc-transports/ssh
 go 1.26.4
 
 require (
-	golang.org/x/crypto v0.55.0
+	golang.org/x/crypto v0.56.0
 	google.golang.org/grpc v1.83.2
 )
 
